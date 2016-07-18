@@ -13,6 +13,8 @@
 #include <fstream>
 #include <string>
 
+#include "zypp/thread/Thread.h"
+
 #include "zypp/base/Logger.h"
 #include "zypp/base/LogControl.h"
 #include "zypp/base/ProfilingFormater.h"
@@ -108,30 +110,52 @@ namespace zypp
   { /////////////////////////////////////////////////////////////////
 
     ///////////////////////////////////////////////////////////////////
-    // LineFormater
-    ///////////////////////////////////////////////////////////////////
-    std::string LogControl::LineFormater::format( const std::string & group_r,
-                                                  logger::LogLevel    level_r,
-                                                  const char *        file_r,
-                                                  const char *        func_r,
-                                                  int                 line_r,
-                                                  const std::string & message_r )
-    {
-      static char hostname[1024];
-      static char nohostname[] = "unknown";
-      std::string now( Date::now().form( "%Y-%m-%d %H:%M:%S" ) );
-      return str::form( "%s <%d> %s(%d) [%s] %s(%s):%d %s",
-                        now.c_str(), level_r,
-                        ( gethostname( hostname, 1024 ) ? nohostname : hostname ),
-                        getpid(),
-                        group_r.c_str(),
-                        file_r, func_r, line_r,
-                        message_r.c_str() );
-    }
-
-    ///////////////////////////////////////////////////////////////////
     namespace logger
     { /////////////////////////////////////////////////////////////////
+
+    struct OSDHook
+    {
+      struct Excl
+      {
+	explicit Excl( std::mutex & mtx_r )
+	: _str( std::cerr )
+	, _mtx( new std::lock_guard<std::mutex>( mtx_r ) )
+	{}
+
+	template<class Tp>
+	Excl & operator<<( Tp && val )
+	{ _str << std::forward<Tp>(val); return *this; }
+
+	Excl & operator<<( std::ostream& (*iomanip)( std::ostream& ) )
+	{ _str << iomanip; return *this; }
+
+      private:
+	std::ostream & _str;
+	std::shared_ptr<std::lock_guard<std::mutex>> _mtx;
+      };
+
+      template<class Tp>
+      Excl operator<<( Tp && val )
+      { return Excl( _mtx ) << std::forward<Tp>(val); }
+
+      Excl operator<<( std::ostream& (*iomanip)( std::ostream& ) )
+      { return Excl( _mtx ) << iomanip; }
+
+      private:
+	std::mutex _mtx;
+    };
+
+    std::ostream & operator<<( std::ostream & str, const std::ostream & obj )
+    {
+      return str << "["
+      << ( obj.good() ? "g" : "_" )
+      << ( obj.eof()  ? "e" : "_" )
+      << ( obj.fail() ? "F" : "_" )
+      << ( obj.bad()  ? "B" : "_" )
+      << "]";
+    }
+
+    OSDHook OSD;
 
       inline void putStream( const std::string & group_r, LogLevel level_r,
                              const char * file_r, const char * func_r, int line_r,
@@ -179,7 +203,7 @@ namespace zypp
               char tmp = ch;
               writeout( &tmp, 1 );
             }
-          return 0;
+          return ch;
         }
         /** */
         virtual int writeout( const char* s, std::streamsize n )
@@ -228,15 +252,30 @@ namespace zypp
         Loglinestream( const std::string & group_r, LogLevel level_r )
         : _mybuf( group_r, level_r )
         , _mystream( &_mybuf )
-        {}
+	, _tid( std::this_thread::get_id() )
+        {
+	  static std::mutex writeOut_mutex;
+	  std::lock_guard<std::mutex> lock( writeOut_mutex );
+	  static unsigned idx = 0;
+	  OSD << "LLS " << _tid << " " << ++idx << " " << group_r << " " << level_r << endl;
+	}
         /** */
         ~Loglinestream()
-        { _mystream.flush(); }
+        {
+	  _mystream.flush();
+	  OSD << "LLS " << _tid << " cnt " << _cnt << " " << _mystream << endl;
+	}
 
       public:
         /** */
         std::ostream & getStream( const char * fil_r, const char * fnc_r, int lne_r )
         {
+	  if ( ! _mystream )
+	  {
+	    OSD << "LLS " << _tid << " cnt " << _cnt << " " << _mystream << endl;
+	    throw 99;
+	  }
+	  ++_cnt;
           _mybuf.tagSet( fil_r, fnc_r, lne_r );
           return _mystream;
         }
@@ -244,6 +283,8 @@ namespace zypp
       private:
         Loglinebuf   _mybuf;
         std::ostream _mystream;
+	std::thread::id _tid;
+	unsigned _cnt = 0;
       };
       ///////////////////////////////////////////////////////////////////
 
@@ -315,17 +356,34 @@ namespace zypp
           if ( level_r == E_XXX && !_excessive )
             return _no_stream;
 
-          if ( !_streamtable[group_r][level_r] )
-            {
-              _streamtable[group_r][level_r].reset( new Loglinestream( group_r, level_r ) );
-            }
-          std::ostream & ret( _streamtable[group_r][level_r]->getStream( file_r, func_r, line_r ) );
+#if ( _REENTRANT )
+	  std::thread::id tid( std::this_thread::get_id() );
+	  ThreadStreamTable::iterator it( _streamtable.find( tid ) );
+	  if ( it == _streamtable.end() )
+	  {
+	    std::lock_guard<std::mutex> lock( _streamtable_mutex );
+	    OSD << "+++++LLLLL" << tid << "LLLLL+++++" << endl;
+	    it = _streamtable.emplace( tid, StreamTable() ).first;
+	    _identTable[tid] = str::form( "{T%02lu} ", (unsigned long)_identTable.size() );
+	    OSD << "-----LLLLL" << tid << "LLLLL-----" << endl;
+	  }
+	  StreamPtr & streamPtr( (it->second)[group_r][level_r] );
+
+#else
+	  StreamPtr & streamPtr( _streamtable[group_r][level_r] );
+#endif
+          if ( !streamPtr )
+	  {
+
+	    streamPtr.reset( new Loglinestream( group_r, level_r ) );
+	  }
+	  std::ostream & ret( streamPtr->getStream( file_r, func_r, line_r ) );
 	  if ( !ret )
 	  {
 	    ret.clear();
 	    ret << "---<RESET LOGSTREAM FROM FAILED STATE]" << endl;
 	  }
-          return ret;
+	  return ret;
         }
 
         /** Format and write out a logline from Loglinebuf. */
@@ -336,18 +394,32 @@ namespace zypp
                         int                 line_r,
                         const std::string & message_r )
         {
-          if ( _lineWriter )
-            _lineWriter->writeOut( _lineFormater->format( group_r, level_r,
-                                                          file_r, func_r, line_r,
-                                                          message_r ) );
+	  if ( _lineWriter )
+	  {
+	    // format can be unprotected as soon as Date::format is safe (the scoped locale setter)
+	    const std::string & str( _lineFormater->format( group_r, level_r, file_r, func_r, line_r, message_r ) );
+#if ( _REENTRANT )
+	    static std::mutex writeOut_mutex;
+	    std::lock_guard<std::mutex> lock( writeOut_mutex );
+#endif
+	    _lineWriter->writeOut( str );
+	  }
         }
 
       private:
-        typedef shared_ptr<Loglinestream>        StreamPtr;
+        typedef scoped_ptr<Loglinestream>        StreamPtr;
         typedef std::map<LogLevel,StreamPtr>     StreamSet;
         typedef std::map<std::string,StreamSet>  StreamTable;
         /** one streambuffer per group and level */
-        StreamTable _streamtable;
+#if ( _REENTRANT )
+	typedef std::map<std::thread::id,StreamTable>	ThreadStreamTable;
+	typedef std::map<std::thread::id,std::string>	ThreadIdentTable;
+        ThreadStreamTable	_streamtable;
+	mutable std::mutex		_streamtable_mutex;
+	ThreadIdentTable	_identTable;
+#else
+	StreamTable _streamtable;
+#endif
 
       private:
         /** Singleton ctor.
@@ -366,14 +438,58 @@ namespace zypp
             shared_ptr<LogControl::LineFormater> formater(new ProfilingFormater);
             setLineFormater(formater);
           }
+#if ( _REENTRANT )
+	  // preload main thread
+          std::thread::id tid( std::this_thread::get_id() );
+          _streamtable[tid];
+	  _identTable[tid];	// empty thread ident
+#endif
         }
 
         ~LogControlImpl()
-        {
-          _lineWriter.reset();
-        }
+        { _lineWriter.reset(); }
 
       public:
+#if ( _REENTRANT )
+	std::string tident() const
+	{
+	  //std::lock_guard<std::mutex> lock( _streamtable_mutex );
+	  std::thread::id tid( std::this_thread::get_id() );
+	  std::string ret;
+	  try
+	  {
+	    ThreadIdentTable::const_iterator it( _identTable.find( tid ) );
+	    if ( it == _identTable.end() )
+	    {
+	      it = _identTable.find( tid );
+	      if ( it == _identTable.end() )
+	      {
+		OSD << "*****XXXXX" << tid << "XXXXX*****" << endl;
+		ret = "OOPS!";
+	      }
+	      else
+	      {
+		OSD << "*****XXXXX" << tid << "XXXXX*****" << endl;
+		ret = it->second;
+	      }
+
+	    }
+	    else
+	      ret = it->second;
+	  }
+	  catch ( const std::exception & e )
+	  {
+	    OSD << "*****XXXXX" << e.what() << " " << std::this_thread::get_id() << "XXXXX*****" << endl;
+	    ret = e.what();
+	  }
+	  catch ( ... )
+	  {
+	    throw;
+
+	  }
+	  return ret;
+	}
+#endif
         /** The LogControlImpl singleton
          * \note As most dtors log, it is inportant that the
          * LogControlImpl instance is the last static variable
@@ -405,17 +521,11 @@ namespace zypp
       //
       ///////////////////////////////////////////////////////////////////
 
-      std::ostream & getStream( const char * group_r,
-                                LogLevel     level_r,
-                                const char * file_r,
-                                const char * func_r,
-                                const int    line_r )
+      std::ostream & getStream( const char * group_r, LogLevel level_r,
+				       const char * file_r, const char * func_r, const int line_r )
       {
-        return LogControlImpl::instance().getStream( group_r,
-                                                   level_r,
-                                                   file_r,
-                                                   func_r,
-                                                   line_r );
+        return LogControlImpl::instance().getStream( group_r, level_r,
+						     file_r, func_r, line_r );
       }
 
       /** That's what Loglinebuf calls.  */
@@ -424,8 +534,8 @@ namespace zypp
                              const std::string & buffer_r )
       {
         LogControlImpl::instance().putStream( group_r, level_r,
-                                            file_r, func_r, line_r,
-                                            buffer_r );
+					      file_r, func_r, line_r,
+					      buffer_r );
       }
 
       bool isExcessive()
@@ -435,14 +545,43 @@ namespace zypp
     } // namespace logger
     ///////////////////////////////////////////////////////////////////
 
+    using logger::LogControlImpl;
+
+    ///////////////////////////////////////////////////////////////////
+    // LineFormater
+    ///////////////////////////////////////////////////////////////////
+    std::string LogControl::LineFormater::format( const std::string & group_r,
+                                                  logger::LogLevel    level_r,
+                                                  const char *        file_r,
+                                                  const char *        func_r,
+                                                  int                 line_r,
+                                                  const std::string & message_r )
+    {
+      static char hostname[1024];
+      static char nohostname[] = "unknown";
+      return str::form(
+#if ( _REENTRANT )
+		       "%s <%d> %s(%d) [%s] %s(%s):%d %s%s",
+#else
+		       "%s <%d> %s(%d) [%s] %s(%s):%d %s",
+#endif
+		       Date::now().form( "%Y-%m-%d %H:%M:%S" ).c_str(), level_r,
+		       ( gethostname( hostname, 1024 ) ? nohostname : hostname ),
+		       getpid(),
+		       group_r.c_str(),
+		       file_r, func_r, line_r,
+#if ( _REENTRANT )
+		       LogControlImpl::instance().tident().c_str(),
+#endif
+		       message_r.c_str() );
+    }
+
     ///////////////////////////////////////////////////////////////////
     //
     //	CLASS NAME : LogControl
     //  Forward to LogControlImpl singleton.
     //
     ///////////////////////////////////////////////////////////////////
-
-    using logger::LogControlImpl;
 
     void LogControl::logfile( const Pathname & logfile_r )
     { LogControlImpl::instance().logfile( logfile_r ); }
@@ -472,6 +611,7 @@ namespace zypp
     ///////////////////////////////////////////////////////////////////
     LogControl::TmpExcessive::TmpExcessive()
     { LogControlImpl::instance().excessive( true ); }
+
     LogControl::TmpExcessive::~TmpExcessive()
     { LogControlImpl::instance().excessive( false );  }
 
@@ -482,7 +622,7 @@ namespace zypp
     */
     std::ostream & operator<<( std::ostream & str, const LogControl & obj )
     {
-      return str << LogControlImpl::instance();
+      return str << "LogControlImpl";
     }
 
     /////////////////////////////////////////////////////////////////
