@@ -1,0 +1,15 @@
+<channel>
+  <subchannel>
+    <package><name>.</name></package>
+    <package><name>?</name></package>
+    <package><name>*</name></package>
+    <package><name>+</name></package>
+    <package><name>[</name></package>
+    <package><name>]</name></package>
+    <package><name>(</name></package>
+    <package><name>)</name></package>
+    <package><name>{</name></package>
+    <package><name>}</name></package>
+    <package><name>|</name></package>
+    <package><name>/</name></package>
+</subchannel></channel>

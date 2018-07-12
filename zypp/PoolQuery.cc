@@ -756,6 +756,7 @@ attremptycheckend:
 
   string PoolQuery::Impl::createRegex( const StrContainer & container, const Match & flags ) const
   {
+    USR << flags << " - " << container << endl;
 //! macro for word boundary tags for regexes
 #define WB (_match_word ? string("\\b") : string())
     string rstr;
